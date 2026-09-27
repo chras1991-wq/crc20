@@ -20,8 +20,8 @@ function validPsbt() {
 
 test("rejects malformed PSBT and reviews a structurally valid PSBT", async ({ page }) => {
   await page.goto("/");
-  await expect(page.getByRole("heading", { name: /真实 PSBT/ })).toBeVisible();
-  await expect(page.getByText("协议索引器未连接")).toBeVisible();
+  await expect(page.getByRole("heading", { name: /CRC 实时市场/ })).toBeVisible();
+  await expect(page.getByText("crc.garden 索引器")).toBeVisible();
 
   const field = page.getByPlaceholder(/粘贴以 cHNidP/);
   await field.fill("cHNidP8BAA==");
@@ -32,8 +32,16 @@ test("rejects malformed PSBT and reviews a structurally valid PSBT", async ({ pa
   await page.getByRole("button", { name: "解析并检查" }).click();
   await expect(page.getByRole("heading", { name: "逐项核对交易" })).toBeVisible();
   await expect(page.getByText("2,000 sats")).toBeVisible();
-  await expect(page.getByText("未连接 CRC-20 协议索引器")).toBeVisible();
+  await expect(page.getByText("此 PSBT 并非来自 CRC 市场接口")).toBeVisible();
   await expect(page.getByRole("button", { name: "连接真实钱包后签名" })).toBeVisible();
+});
+
+test("loads indexed LEAF listings from the crc.garden API", async ({ page }) => {
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "LEAF 实时卖单" })).toBeVisible();
+  await expect(page.getByText("CRC 索引器已连接")).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByText(/个有效卖单/)).toBeVisible();
+  await expect(page.getByRole("button", { name: "购买" }).first()).toBeVisible();
 });
 
 test("offers real wallet connections without a demo wallet", async ({ page }) => {

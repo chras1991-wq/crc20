@@ -17,12 +17,13 @@ import {
   X,
 } from "lucide-react";
 import { address, networks, Psbt, Transaction } from "bitcoinjs-lib";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 type WalletId = "unisat" | "okx" | "xverse" | "leather" | "magiceden" | "phantom";
 type BitcoinProvider = {
-  requestAccounts?: () => Promise<string[]>;
-  getAccounts?: () => Promise<string[]>;
+  requestAccounts?: () => Promise<unknown[]>;
+  getAccounts?: () => Promise<unknown[]>;
+  getPublicKey?: () => Promise<string>;
   signPsbt?: (psbt: string, options?: Record<string, unknown>) => Promise<string>;
   signPSBT?: (psbt: string) => Promise<string>;
   signMessage?: (message: string, type?: string) => Promise<string>;
@@ -62,6 +63,47 @@ type ParsedPsbt = {
   warnings: string[];
 };
 
+type CrcListing = {
+  amount: string;
+  amount_atoms: string;
+  created_at: string;
+  expires_at: string;
+  listing_id: string;
+  platform_fee_sats: string;
+  price_sats: string;
+  seller_address: string;
+  settlement_transaction_id: string;
+  status: string;
+  ticker: string;
+};
+
+type CrcStats = {
+  buyer_count: number;
+  floor_change_24h_percent: string;
+  floor_price_usd_per_token: string;
+  market_cap_usd: string;
+  total_trades: number;
+  total_volume_usd: string;
+  volume_7d_usd: string;
+};
+
+type CrcConfig = {
+  enabled: boolean;
+  fast_fee_rate_sat_per_vbyte: string;
+  minimum_purchase_fee_rate_sat_per_vbyte: string;
+  platform_fee_sats: string;
+  unavailable_reason: string | null;
+};
+
+type PreparedCrcOrder = {
+  authorization: { expires_at: string; token: string };
+  buyer_input_count: number;
+  buyer_input_start: number;
+  order_id: string;
+  psbt_base64: string;
+  transaction_id: string;
+};
+
 function providerFor(id: WalletId): BitcoinProvider | undefined {
   if (typeof window === "undefined") return undefined;
   return {
@@ -86,6 +128,31 @@ function toHex(value: Uint8Array) {
   return Array.from(value, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+function psbtResultToBase64(value: string) {
+  const normalized = value.trim();
+  if (normalized.startsWith("cHNidP")) return normalized;
+  if (!/^[0-9a-fA-F]+$/.test(normalized) || normalized.length % 2 !== 0) {
+    throw new Error("钱包返回的 PSBT 编码无法识别");
+  }
+  const bytes = normalized.match(/.{2}/g)?.map((byte) => String.fromCharCode(Number.parseInt(byte, 16))) ?? [];
+  return window.btoa(bytes.join(""));
+}
+
+async function crcApi<T>(path: string, body?: Record<string, unknown>): Promise<T> {
+  const response = await fetch(`/api/crc/marketplace/${path}`, {
+    method: body ? "POST" : "GET",
+    headers: body ? { "content-type": "application/json" } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+    cache: "no-store",
+  });
+  const result = (await response.json()) as { data?: T; error?: { message?: string } | string };
+  if (!response.ok || result.data === undefined) {
+    const message = typeof result.error === "string" ? result.error : result.error?.message;
+    throw new Error(message || "CRC marketplace request failed");
+  }
+  return result.data;
+}
+
 function inputAmount(psbt: Psbt, index: number): bigint | null {
   const input = psbt.data.inputs[index];
   if (input.witnessUtxo) return input.witnessUtxo.value;
@@ -96,7 +163,7 @@ function inputAmount(psbt: Psbt, index: number): bigint | null {
   return null;
 }
 
-function parsePsbt(raw: string): ParsedPsbt {
+function parsePsbt(raw: string, crcVerified = false): ParsedPsbt {
   const normalized = raw.trim().replace(/\s+/g, "");
   if (!normalized) throw new Error("请粘贴卖家提供的 PSBT");
   if (normalized.length > 500_000) throw new Error("PSBT 超过 500KB，已拒绝解析");
@@ -144,13 +211,250 @@ function parsePsbt(raw: string): ParsedPsbt {
   if (outputs.some((output) => output.address.startsWith("非标准脚本"))) {
     warnings.push("包含无法识别的输出脚本，请确认其协议含义");
   }
-  warnings.push("未连接 CRC-20 协议索引器，无法验证代币数量或归属");
+  if (!crcVerified) warnings.push("此 PSBT 并非来自 CRC 市场接口，CRC-20 资产归属未验证");
   return { psbt, inputs, outputs, inputTotal, outputTotal, fee, feePercent, warnings };
+}
+
+function CrcMarketplace({
+  account,
+  publicKey,
+  walletId,
+  openWallet,
+  notify,
+}: {
+  account: string;
+  publicKey: string;
+  walletId: WalletId | null;
+  openWallet: () => void;
+  notify: (message: string) => void;
+}) {
+  const [listings, setListings] = useState<CrcListing[]>([]);
+  const [stats, setStats] = useState<CrcStats | null>(null);
+  const [config, setConfig] = useState<CrcConfig | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [selected, setSelected] = useState<CrcListing | null>(null);
+  const [prepared, setPrepared] = useState<PreparedCrcOrder | null>(null);
+  const [review, setReview] = useState<ParsedPsbt | null>(null);
+  const [orderStatus, setOrderStatus] = useState("");
+  const [orderError, setOrderError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function refresh() {
+    try {
+      const [liveListings, liveStats, liveConfig] = await Promise.all([
+        crcApi<{ items: CrcListing[] }>("listings?ticker=LEAF"),
+        crcApi<CrcStats>("stats?ticker=LEAF"),
+        crcApi<CrcConfig>("config"),
+      ]);
+      setListings(liveListings.items.filter((item) => item.status === "ACTIVE"));
+      setStats(liveStats);
+      setConfig(liveConfig);
+      setError("");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "CRC 市场连接失败");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    refresh();
+    const timer = window.setInterval(refresh, 30_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  function beginOrder(listing: CrcListing) {
+    if (!account || !walletId) {
+      openWallet();
+      return;
+    }
+    if (!publicKey) {
+      notify("当前钱包未返回支付公钥，请解锁钱包并重新连接");
+      return;
+    }
+    setSelected(listing);
+    setPrepared(null);
+    setReview(null);
+    setOrderStatus("");
+    setOrderError("");
+  }
+
+  async function prepareOrder() {
+    if (!selected || !account || !publicKey) return;
+    setBusy(true);
+    setOrderError("");
+    setOrderStatus("CRC 索引器正在锁定卖单并构造 PSBT…");
+    try {
+      const feeRate = Math.max(
+        Number(config?.fast_fee_rate_sat_per_vbyte ?? 7),
+        Number(config?.minimum_purchase_fee_rate_sat_per_vbyte ?? 7),
+      );
+      const order = await crcApi<PreparedCrcOrder>("orders/prepare", {
+        address: account,
+        public_key: publicKey,
+        listing_id: selected.listing_id,
+        fee_rate_sat_per_vbyte: String(feeRate),
+      });
+      const parsedOrder = parsePsbt(order.psbt_base64, true);
+      setPrepared(order);
+      setReview(parsedOrder);
+      setOrderStatus("卖单已由 CRC 市场锁定，请核对真实 PSBT");
+    } catch (cause) {
+      setOrderStatus("");
+      setOrderError(cause instanceof Error ? cause.message : "订单准备失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function signAndBroadcast() {
+    if (!prepared || !walletId || !account) return;
+    const provider = providerFor(walletId);
+    if (!provider) return;
+    setBusy(true);
+    setOrderError("");
+    try {
+      setOrderStatus("等待钱包签署买方输入…");
+      const indexes = Array.from(
+        { length: prepared.buyer_input_count },
+        (_, index) => prepared.buyer_input_start + index,
+      );
+      let walletResult: string;
+      if (provider.signPsbt) {
+        walletResult = await provider.signPsbt(prepared.psbt_base64, {
+          autoFinalized: false,
+          toSignInputs: indexes.map((index) => ({ index, address: account })),
+        });
+      } else if (provider.signPSBT) {
+        walletResult = await provider.signPSBT(prepared.psbt_base64);
+      } else {
+        throw new Error("该钱包没有兼容的 PSBT 签名接口");
+      }
+      const signed = psbtResultToBase64(walletResult);
+      Psbt.fromBase64(signed, { network: networks.bitcoin });
+
+      setOrderStatus("CRC 市场正在合并卖家与买家签名…");
+      const finalized = await crcApi<Record<string, unknown>>("orders/finalize", {
+        order_id: prepared.order_id,
+        token: prepared.authorization.token,
+        signed_psbt_base64: signed,
+      });
+      if (typeof finalized.finalized_psbt_base64 !== "string") {
+        setOrderStatus(`订单状态：${String(finalized.status ?? "FINALIZING")}`);
+        return;
+      }
+
+      setOrderStatus("正在通过 CRC 节点广播主网交易…");
+      const broadcast = await crcApi<{ transaction_id: string; status: string }>("orders/broadcast", {
+        order_id: prepared.order_id,
+        token: prepared.authorization.token,
+        finalized_psbt_base64: finalized.finalized_psbt_base64,
+      });
+      setOrderStatus(`已广播：${broadcast.transaction_id}`);
+      notify("CRC-20 购买交易已广播");
+      await refresh();
+    } catch (cause) {
+      setOrderError(cause instanceof Error ? cause.message : "签名或广播失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="crc-market-live" id="market">
+      <div className="section-heading">
+        <div>
+          <span className="section-index">01 / CRC.GARDEN LIVE</span>
+          <h2>LEAF 实时卖单</h2>
+        </div>
+        <span className={`indexer-badge ${error ? "offline" : ""}`}>
+          <span />{error ? "CRC API 异常" : "CRC 索引器已连接"}
+        </span>
+      </div>
+
+      {stats && (
+        <div className="live-stats">
+          <div><span>地板价</span><strong>${stats.floor_price_usd_per_token}</strong><small>{stats.floor_change_24h_percent}% / 24h</small></div>
+          <div><span>累计成交</span><strong>{stats.total_trades.toLocaleString()}</strong><small>{stats.buyer_count.toLocaleString()} 位买家</small></div>
+          <div><span>累计交易额</span><strong>${Number(stats.total_volume_usd).toLocaleString(undefined, { maximumFractionDigits: 2 })}</strong><small>CRC 索引数据</small></div>
+          <div><span>7 日交易额</span><strong>${Number(stats.volume_7d_usd).toLocaleString(undefined, { maximumFractionDigits: 2 })}</strong><small>LEAF / BTC</small></div>
+        </div>
+      )}
+
+      <div className="panel live-orderbook">
+        <div className="panel-head">
+          <strong>crc.garden 在售订单</strong>
+          <span>{loading ? "同步中…" : `${listings.length} 个有效卖单`}</span>
+        </div>
+        {error ? (
+          <div className="market-empty"><AlertTriangle /><strong>CRC 市场暂不可用</strong><span>{error}</span><button onClick={refresh}>重新连接</button></div>
+        ) : (
+          <>
+            <div className="live-table-head"><span>数量</span><span>总价</span><span>单价</span><span>卖家</span><span /></div>
+            {listings.slice(0, 30).map((listing) => {
+              const unitPrice = Number(listing.price_sats) / Number(listing.amount);
+              return (
+                <div className="live-listing" key={listing.listing_id}>
+                  <span><strong>{Number(listing.amount).toLocaleString()}</strong> LEAF</span>
+                  <span>{Number(listing.price_sats).toLocaleString()} sats</span>
+                  <span>{unitPrice.toFixed(2)} sats</span>
+                  <code>{short(listing.seller_address)}</code>
+                  <button onClick={() => beginOrder(listing)}>购买</button>
+                </div>
+              );
+            })}
+          </>
+        )}
+      </div>
+
+      {selected && (
+        <div className="modal-backdrop">
+          <div className="modal crc-order-modal">
+            <button className="modal-close" onClick={() => !busy && setSelected(null)}><X size={19} /></button>
+            <span className="modal-icon"><LockKeyhole /></span>
+            <span className="step-count">CRC.GARDEN MARKETPLACE</span>
+            <h2>{prepared ? "审核并签署真实订单" : "锁定 CRC 卖单"}</h2>
+            <div className="order-summary crc-summary">
+              <div><span>买入</span><strong>{Number(selected.amount).toLocaleString()} LEAF</strong></div>
+              <div><span>支付</span><strong>{Number(selected.price_sats).toLocaleString()} sats</strong></div>
+              <div><span>平台费</span><strong>{Number(selected.platform_fee_sats).toLocaleString()} sats</strong></div>
+              <div><span>索引交易</span><strong>{short(selected.settlement_transaction_id)}</strong></div>
+            </div>
+            {review && (
+              <>
+                <div className="crc-verified"><ShieldCheck size={16} />该订单及 PSBT 由 crc.garden 索引器和撮合接口返回</div>
+                <div className="tx-details">
+                  <div><span>PSBT 输入</span><strong>{review.inputs.length}</strong></div>
+                  <div><span>PSBT 输出</span><strong>{review.outputs.length}</strong></div>
+                  <div><span>矿工费</span><strong>{sats(review.fee)}</strong></div>
+                  <div><span>手续费比例</span><strong>{review.feePercent.toFixed(2)}%</strong></div>
+                </div>
+              </>
+            )}
+            {orderStatus && <div className="crc-order-status"><Radio size={14} /><span>{orderStatus}</span></div>}
+            {orderError && <div className="hard-error crc-error"><X size={15} /><span>{orderError}</span></div>}
+            {!prepared ? (
+              <button className="primary wide real-wide" onClick={prepareOrder} disabled={busy || config?.enabled === false}>
+                {busy ? <LoaderCircle className="spin" size={17} /> : <LockKeyhole size={17} />}锁单并获取真实 PSBT
+              </button>
+            ) : (
+              <button className="primary wide real-wide" onClick={signAndBroadcast} disabled={busy || orderStatus.startsWith("已广播")}>
+                {busy ? <LoaderCircle className="spin" size={17} /> : <FileSignature size={17} />}钱包签名并通过 CRC 节点广播
+              </button>
+            )}
+            <p className="crc-source">数据与订单接口：crc.garden · Bitcoin Mainnet</p>
+          </div>
+        </div>
+      )}
+    </section>
+  );
 }
 
 export default function TradePage() {
   const [walletOpen, setWalletOpen] = useState(false);
   const [account, setAccount] = useState("");
+  const [publicKey, setPublicKey] = useState("");
   const [walletId, setWalletId] = useState<WalletId | null>(null);
   const [walletName, setWalletName] = useState("");
   const [rawPsbt, setRawPsbt] = useState("");
@@ -183,19 +487,25 @@ export default function TradePage() {
     }
     setBusy(true);
     try {
-      let accounts: string[] = [];
-      if (provider.requestAccounts) accounts = await provider.requestAccounts();
-      else if (provider.getAccounts) accounts = await provider.getAccounts();
+      let accountResults: unknown[] = [];
+      if (provider.requestAccounts) accountResults = await provider.requestAccounts();
+      else if (provider.getAccounts) accountResults = await provider.getAccounts();
       else if (provider.request) {
         const response = await provider.request("getAccounts");
-        if (Array.isArray(response)) {
-          accounts = response
-            .map((item) => (typeof item === "string" ? item : (item as { address?: string }).address))
-            .filter((item): item is string => Boolean(item));
-        }
+        if (Array.isArray(response)) accountResults = response;
       }
-      if (!accounts[0]) throw new Error("钱包未返回 Bitcoin 主网地址");
-      setAccount(accounts[0]);
+      const accountDetails = accountResults
+        .map((item) => (typeof item === "string" ? { address: item, publicKey: "" } : item as { address?: string; publicKey?: string; public_key?: string }))
+        .filter((item): item is { address: string; publicKey?: string; public_key?: string } => Boolean(item.address));
+      if (!accountDetails[0]) throw new Error("钱包未返回 Bitcoin 主网地址");
+      let key = accountDetails[0].publicKey || accountDetails[0].public_key || "";
+      if (!key && provider.getPublicKey) key = await provider.getPublicKey();
+      if (!key && provider.request) {
+        const response = await provider.request("getPublicKey").catch(() => null);
+        if (typeof response === "string") key = response;
+      }
+      setAccount(accountDetails[0].address);
+      setPublicKey(key);
       setWalletId(option.id);
       setWalletName(option.name);
       setWalletOpen(false);
@@ -296,7 +606,8 @@ export default function TradePage() {
         <nav className="nav">
           <a className="brand" href="#"><span className="brand-mark"><Leaf size={17} /></span><span>leaf</span></a>
           <div className="nav-links real-nav">
-            <a className="active" href="#psbt">PSBT 交易台</a>
+            <a className="active" href="#market">实时市场</a>
+            <a href="#psbt">PSBT 工具</a>
             <a href="#signer">消息签名</a>
             <a href="https://github.com/BitcoinWorldTrustFoundation/precop" target="_blank" rel="noreferrer">
               PRECOP 规范 <ArrowUpRight size={13} />
@@ -313,21 +624,29 @@ export default function TradePage() {
         <div className="real-hero-inner">
           <div>
             <div className="eyebrow"><Radio size={13} /> Bitcoin Mainnet</div>
-            <h1>真实 PSBT<br /><em>审核与签名</em></h1>
-            <p>不生成假订单，不模拟余额。只有通过结构校验的真实 PSBT 才能进入钱包签名。</p>
+            <h1>CRC 实时市场<br /><em>审核与签名</em></h1>
+            <p>直接使用 crc.garden 的索引、挂单、锁单、PSBT 合并与广播接口。</p>
           </div>
           <div className="truth-card">
             <ShieldAlert size={23} />
             <strong>CRC-20 验证状态</strong>
-            <span>协议索引器未连接</span>
-            <p>当前可以真实解析、签名和广播 Bitcoin PSBT，但不能证明其中的 CRC-20 资产有效。</p>
+            <span>crc.garden 索引器</span>
+            <p>LEAF 余额、有效挂单和成交数据由 crc.garden 主网接口返回，并显示其索引高度。</p>
           </div>
         </div>
       </section>
 
+      <CrcMarketplace
+        account={account}
+        publicKey={publicKey}
+        walletId={walletId}
+        openWallet={() => setWalletOpen(true)}
+        notify={notify}
+      />
+
       <section className="real-workbench" id="psbt">
         <div className="section-heading">
-          <div><span className="section-index">01 / IMPORT</span><h2>导入卖家 PSBT</h2></div>
+          <div><span className="section-index">02 / MANUAL IMPORT</span><h2>手动导入 PSBT</h2></div>
           <span className="mainnet-status"><span /> MAINNET</span>
         </div>
 
