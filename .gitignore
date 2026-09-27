@@ -27,3 +27,7 @@ npm-debug.log*
 # generated agent guidance
 AGENTS.md
 CLAUDE.md
+
+# browser test output
+/test-results/
+/playwright-report/
