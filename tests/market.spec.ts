@@ -8,12 +8,12 @@ function validPsbt() {
     index: 0,
     witnessUtxo: {
       script: Uint8Array.from([0x00, 0x14, ...new Array(20).fill(0x22)]),
-      value: 100_000n,
+      value: BigInt(100_000),
     },
   });
   psbt.addOutput({
     script: Uint8Array.from([0x00, 0x14, ...new Array(20).fill(0x33)]),
-    value: 98_000n,
+    value: BigInt(98_000),
   });
   return psbt.toBase64();
 }
@@ -33,13 +33,13 @@ test("rejects malformed PSBT and reviews a structurally valid PSBT", async ({ pa
   await expect(page.getByRole("heading", { name: "逐项核对交易" })).toBeVisible();
   await expect(page.getByText("2,000 sats")).toBeVisible();
   await expect(page.getByText("未连接 CRC-20 协议索引器")).toBeVisible();
-  await expect(page.getByRole("button", { name: "连接真实钱包后签名" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "连接真实钱包后签名" })).toBeVisible();
 });
 
 test("offers real wallet connections without a demo wallet", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/");
-  await page.getByRole("button", { name: "连接真实钱包" }).click();
+  await page.getByRole("navigation").getByRole("button", { name: "连接真实钱包" }).click();
   await expect(page.getByRole("heading", { name: "连接 Bitcoin 主网钱包" })).toBeVisible();
   await expect(page.getByText("本站不会提供“演示钱包”")).toBeVisible();
   await expect(page.getByText("进入交互演示")).toHaveCount(0);

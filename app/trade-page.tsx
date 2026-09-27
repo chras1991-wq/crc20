@@ -132,12 +132,13 @@ function parsePsbt(raw: string): ParsedPsbt {
 
   const unknownInputs = inputs.filter((input) => input.amount === null);
   if (unknownInputs.length) throw new Error(`有 ${unknownInputs.length} 个输入缺少 UTXO 金额，无法安全计算手续费`);
-  const inputTotal = inputs.reduce((sum, input) => sum + (input.amount ?? 0n), 0n);
-  const outputTotal = outputs.reduce((sum, output) => sum + output.amount, 0n);
+  const zero = BigInt(0);
+  const inputTotal = inputs.reduce((sum, input) => sum + (input.amount ?? zero), zero);
+  const outputTotal = outputs.reduce((sum, output) => sum + output.amount, zero);
   const fee = inputTotal - outputTotal;
-  if (fee < 0n) throw new Error("输出金额高于输入金额，PSBT 无效");
+  if (fee < zero) throw new Error("输出金额高于输入金额，PSBT 无效");
 
-  const feePercent = inputTotal === 0n ? 0 : Number((fee * 10_000n) / inputTotal) / 100;
+  const feePercent = inputTotal === zero ? 0 : Number((fee * BigInt(10_000)) / inputTotal) / 100;
   const warnings: string[] = [];
   if (feePercent > 5) warnings.push(`矿工费占输入金额 ${feePercent.toFixed(2)}%，异常偏高`);
   if (outputs.some((output) => output.address.startsWith("非标准脚本"))) {
