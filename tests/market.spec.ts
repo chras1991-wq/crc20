@@ -30,6 +30,6 @@ test("keeps the market usable on a mobile viewport", async ({ page }) => {
   await expect(page.getByRole("heading", { name: /快捷交易/ })).toBeVisible();
   await page.getByRole("button", { name: "打开菜单" }).click();
   await expect(page.getByRole("link", { name: "签名工具" })).toBeVisible();
-  await page.getByRole("button", { name: "连接钱包" }).click();
+  await page.getByRole("button", { name: "连接钱包", exact: true }).click();
   await expect(page.getByRole("heading", { name: "连接 Bitcoin 钱包" })).toBeVisible();
 });
