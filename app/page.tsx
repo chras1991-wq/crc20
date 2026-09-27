@@ -281,7 +281,7 @@ export default function Home() {
               <span>价格 (sats)</span><span>数量 (LEAF)</span><span>总额 (BTC)</span><span>卖家</span><span />
             </div>
             <div className="book-label ask-label"><ArrowDown size={12} /> 卖单</div>
-            {asks.map((ask, index) => (
+            {asks.map((ask) => (
               <div className="book-row ask-row" key={ask.price}>
                 <div className="depth-bar red" style={{ width: `${(Number(ask.amount.replace(",", "")) / maxDepth) * 48}%` }} />
                 <span className="price ask-price">{ask.price}</span>
